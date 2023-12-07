@@ -5,7 +5,13 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.AnimatorSet;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Point;
+import android.graphics.Rect;
+import android.util.Pair;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewPropertyAnimator;
 import android.view.animation.Interpolator;
 import android.view.animation.OvershootInterpolator;
@@ -46,7 +52,7 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
     private HashMap<Integer, MessageObject.GroupedMessages> willRemovedGroup = new HashMap<>();
     private ArrayList<MessageObject.GroupedMessages> willChangedGroups = new ArrayList<>();
 
-    HashMap<RecyclerView.ViewHolder,Animator> animators = new HashMap<>();
+    HashMap<RecyclerView.ViewHolder, Animator> animators = new HashMap<>();
 
     ArrayList<Runnable> runOnAnimationsEnd = new ArrayList<>();
     HashMap<Long, Long> groupIdToEnterDelay = new HashMap<>();
@@ -55,8 +61,15 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
     private RecyclerView.ViewHolder greetingsSticker;
     private ChatGreetingsView chatGreetingsView;
 
+    private final Interpolator translationAfterDustInterpolator = input -> {
+        float factor = 3.0f;
+        return (float) (Math.pow(2, -10 * input) * Math.sin((input - factor / 4) * (2 * Math.PI) / factor) + 1);
+    };
+
     private boolean reversePositions;
     private final Theme.ResourcesProvider resourcesProvider;
+
+    private boolean dustWasPlayed = false;
 
     public ChatListItemAnimator(ChatActivity activity, RecyclerListView listView, Theme.ResourcesProvider resourcesProvider) {
         this.resourcesProvider = resourcesProvider;
@@ -101,6 +114,8 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
             runAlphaEnterTransition();
         }
 
+        dustWasPlayed = false;
+
         ValueAnimator valueAnimator = ValueAnimator.ofFloat(0, 1f);
         valueAnimator.addUpdateListener(animation -> {
             if (activity != null) {
@@ -125,14 +140,14 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
             return;
         }
         // First, remove stuff
-        for (RecyclerView.ViewHolder holder : mPendingRemovals) {
-            animateRemoveImpl(holder);
-        }
-        mPendingRemovals.clear();
+        animateRemovals();
         // Next, move stuff
         if (movesPending) {
             final ArrayList<MoveInfo> moves = new ArrayList<>();
             moves.addAll(mPendingMoves);
+            for (MoveInfo move : moves) {
+                ((MoveInfoExtended) move).dustWasPlayed = dustWasPlayed;
+            }
             mMovesList.add(moves);
             mPendingMoves.clear();
             Runnable mover = new Runnable() {
@@ -212,13 +227,13 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
             addedItemsHeight += mPendingAdditions.get(i).itemView.getHeight();
         }
 
-        for (RecyclerView.ViewHolder holder : mPendingRemovals) {
-            animateRemoveImpl(holder);
-        }
-        mPendingRemovals.clear();
+        animateRemovals();
         if (movesPending) {
             final ArrayList<MoveInfo> moves = new ArrayList<>();
             moves.addAll(mPendingMoves);
+            for (MoveInfo move : moves) {
+                ((MoveInfoExtended) move).dustWasPlayed = dustWasPlayed;
+            }
             mPendingMoves.clear();
             for (MoveInfo moveInfo : moves) {
                 animateMoveImpl(moveInfo.holder, moveInfo);
@@ -843,10 +858,17 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
             }
         }
 
-        if (translationInterpolator != null) {
-            animatorSet.setInterpolator(translationInterpolator);
+        if (moveInfoExtended.dustWasPlayed) {
+            animatorSet.setInterpolator(translationAfterDustInterpolator);
+            animatorSet.setDuration(getMoveAfterDustDuration());
+        } else {
+            if (translationInterpolator != null) {
+                animatorSet.setInterpolator(translationInterpolator);
+            }
+
+            animatorSet.setDuration(getMoveDuration());
         }
-        animatorSet.setDuration(getMoveDuration());
+
         animatorSet.addListener(new AnimatorListenerAdapter() {
             @Override
             public void onAnimationStart(Animator animator) {
@@ -1372,6 +1394,148 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
         animatorSet.start();
     }
 
+    private void animateRemovals() {
+        if (activity.dustEffectOverlay == null || !activity.dustEffectOverlay.isAvailable()) {
+            for (RecyclerView.ViewHolder holder : mPendingRemovals) {
+                animateRemoveImpl(holder);
+            }
+            mPendingRemovals.clear();
+            return;
+        }
+
+        while (!mPendingRemovals.isEmpty()) {
+            RecyclerView.ViewHolder rootHolder = mPendingRemovals.get(0);
+            if (rootHolder.itemView instanceof ChatMessageCell) {
+                ChatMessageCell cell = (ChatMessageCell) rootHolder.itemView;
+
+                ArrayList<RecyclerView.ViewHolder> groupedHolders = new ArrayList<>();
+                groupedHolders.add(rootHolder);
+
+                MessageObject.GroupedMessages group = cell.getCurrentMessagesGroup();
+                if (group != null) {
+                    for (int i = 1; i < mPendingRemovals.size(); i++) {
+                        RecyclerView.ViewHolder anotherHolder = mPendingRemovals.get(i);
+                        if (anotherHolder.itemView instanceof ChatMessageCell) {
+                            ChatMessageCell anotherCell = (ChatMessageCell) anotherHolder.itemView;
+                            if (anotherCell.getCurrentMessagesGroup() != null
+                                    && anotherCell.getCurrentMessagesGroup().groupId == group.groupId) {
+                                groupedHolders.add(anotherHolder);
+                            }
+                        }
+                    }
+                }
+                animateRemoveWithDust(groupedHolders);
+                dustWasPlayed = true;
+                mPendingRemovals.removeAll(groupedHolders);
+            } else {
+                animateRemoveImpl(rootHolder);
+                mPendingRemovals.remove(0);
+            }
+        }
+    }
+
+    private void animateRemoveWithDust(ArrayList<RecyclerView.ViewHolder> holders) {
+        ChatMessageCell firstCell = (ChatMessageCell) holders.get(0).itemView;
+        ViewGroup parent = (ViewGroup) firstCell.getParent();
+
+        Bitmap bitmap2 = Bitmap.createBitmap(parent.getWidth(), parent.getHeight(),
+                Bitmap.Config.ARGB_8888);
+        Canvas canvas2 = new Canvas(bitmap2);
+        parent.draw(canvas2);
+
+        Rect parentVisibleRect = new Rect();
+        parent.getGlobalVisibleRect(parentVisibleRect);
+
+        Rect cellVisibleRect = new Rect();
+
+        Rect visibleRect = new Rect();
+        ArrayList<Pair<RecyclerView.ViewHolder, Point>> drawList = new ArrayList<>(holders.size());
+
+        for (RecyclerView.ViewHolder holder : holders) {
+            Point cellGlobalOffset = new Point();
+
+            ChatMessageCell cell = (ChatMessageCell) holder.itemView;
+
+            boolean visible = cell.getGlobalVisibleRect(cellVisibleRect, cellGlobalOffset);
+            visible &= cellVisibleRect.intersect(parentVisibleRect);
+            visible &= cellVisibleRect.intersect(
+                    cell.getBackgroundDrawableLeft() + cellGlobalOffset.x,
+                    cell.getBackgroundDrawableTop() + cellGlobalOffset.y,
+                    cell.getBackgroundDrawableRight() + cellGlobalOffset.x,
+                    cell.getBackgroundDrawableBottom() + cellGlobalOffset.y
+            );
+            if (visible) {
+                visibleRect.union(cellVisibleRect);
+                drawList.add(new Pair<>(holder, cellGlobalOffset));
+
+                //Hack for hiding media checkbox and disable translation left animation
+                cell.setChecked(true, true, false);
+                cell.setChecked(false, false, false);
+                cell.setCheckBoxVisible(false, false);
+            } else {
+                cell.setAlpha(1);
+                cell.setScaleX(1f);
+                cell.setScaleY(1f);
+                cell.setTranslationX(0);
+                cell.setTranslationY(0);
+                dispatchRemoveFinished(holder);
+                dispatchFinishedWhenDone();
+            }
+        }
+
+        Bitmap bitmap = Bitmap.createBitmap(visibleRect.width(), visibleRect.height(),
+                Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        canvas.translate(-visibleRect.left, -visibleRect.top);
+
+        for (Pair<RecyclerView.ViewHolder, Point> pair : drawList) {
+            RecyclerView.ViewHolder holder = pair.first;
+            ChatMessageCell cell = (ChatMessageCell) holder.itemView;
+            Point offset = pair.second;
+
+            boolean hasCheckbox = cell.getCheckBoxTranslation() > 0.0f;
+
+            canvas.save();
+            canvas.translate(offset.x, offset.y);
+            if (cell.drawBackgroundInParent()) {
+                cell.drawBackgroundInternal(canvas, true);
+            }
+            cell.draw(canvas);
+            if (cell.hasOutboundsContent()) {
+                cell.drawOutboundsContent(canvas);
+            }
+            canvas.restore();
+
+            if (hasCheckbox) {
+                cell.setCheckBoxVisible(true, false);
+            }
+
+            mRemoveAnimations.add(holder);
+            dispatchRemoveStarting(holder);
+            cell.clearAnimation();
+        }
+
+        activity.dustEffectOverlay.start(new Point(visibleRect.left, visibleRect.top), bitmap, () -> {
+            for (Pair<RecyclerView.ViewHolder, Point> pair : drawList) {
+                RecyclerView.ViewHolder holder = pair.first;
+                ChatMessageCell cell = (ChatMessageCell) holder.itemView;
+                cell.setAlpha(1);
+                cell.setScaleX(1f);
+                cell.setScaleY(1f);
+                cell.setTranslationX(0);
+                cell.setTranslationY(0);
+                cell.setCheckBoxVisible(false, false);
+
+                if (mRemoveAnimations.remove(holder)) {
+                    dispatchRemoveFinished(holder);
+                    dispatchFinishedWhenDone();
+                }
+            }
+        });
+
+        recyclerListView.stopScroll();
+    }
+
     protected void animateRemoveImpl(final RecyclerView.ViewHolder holder) {
         if (BuildVars.LOGS_ENABLED) {
             FileLog.d("animate remove impl");
@@ -1420,6 +1584,10 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
     @Override
     public long getMoveDuration() {
         return DEFAULT_DURATION;
+    }
+
+    public long getMoveAfterDustDuration() {
+        return 1500;
     }
 
     @Override
@@ -1488,6 +1656,8 @@ public class ChatListItemAnimator extends DefaultItemAnimator {
 
         int deltaLeft, deltaRight, deltaTop, deltaBottom;
         boolean animateRemoveGroup;
+
+        boolean dustWasPlayed;
 
         MoveInfoExtended(RecyclerView.ViewHolder holder, int fromX, int fromY, int toX, int toY) {
             super(holder, fromX, fromY, toX, toY);
