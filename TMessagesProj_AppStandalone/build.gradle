@@ -26,6 +26,8 @@ android {
     compileSdkVersion 33
     buildToolsVersion '33.0.0'
 
+    namespace 'org.telegram.messenger.web'
+
     defaultConfig.applicationId = APP_PACKAGE
 
     sourceSets.main.jniLibs.srcDirs = ['../TMessagesProj/jni/']
